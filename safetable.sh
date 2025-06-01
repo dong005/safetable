@@ -38,18 +38,12 @@ setup_repo() {
         mv /etc/yum.repos.d/*.repo /etc/yum.repos.d/backup/ 2>/dev/null
     fi
     
-    # 创建本地YUM源配置
-    cat > /etc/yum.repos.d/local.repo << 'EOF'
-[local]
-name=CentOS-6.10 - Local Repository
-baseurl=file:///media/cdrom
-gpgcheck=0
-enabled=1
-EOF
-    
-    # 如果有CentOS-Base.repo文件，也尝试使用
+    # 复制CentOS-Base.repo文件
     if [ -f "$SCRIPT_DIR/CentOS-Base.repo" ]; then
         cp "$SCRIPT_DIR/CentOS-Base.repo" /etc/yum.repos.d/
+        echo "已应用CentOS-Base.repo配置"
+    else
+        echo "警告: 未找到CentOS-Base.repo文件"
     fi
     
     # 清除缓存并重新生成
@@ -200,6 +194,12 @@ EOF
 update_china_ip() {
     echo "正在更新中国IP列表..."
     
+    # 检查是否以root权限运行
+    check_root
+    
+    # 检查并安装必要的软件包
+    check_packages
+    
     # 检查wget是否已安装
     if ! command -v wget &>/dev/null; then
         echo "错误: wget未安装，无法更新中国IP列表"
@@ -251,14 +251,42 @@ update_china_ip() {
 apply_iptables_rules() {
     echo "正在应用防火墙规则..."
     
-    # 添加防火墙规则
+    # 清空现有规则
+    iptables -F
+    iptables -X
+    iptables -Z
+    
+    # 设置默认策略
+    iptables -P INPUT ACCEPT
+    iptables -P FORWARD DROP
+    iptables -P OUTPUT ACCEPT
+    
+    # 允许本地回环
+    iptables -A INPUT -i lo -j ACCEPT
+    
+    # 允许已建立的连接
+    iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+    
+    # 允许Ping
+    iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
+    
+    # 允许SSH连接（修改为您自己的SSH端口）
+    iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+    
+    # 允许SIP相关端口（5060-5080）
     iptables -A INPUT -p udp --dport 5060:5080 -m set --match-set china src -j ACCEPT
     iptables -A INPUT -p udp --dport 5060:5080 -j DROP
     iptables -A INPUT -p tcp --dport 5060:5080 -m set --match-set china src -j ACCEPT
     iptables -A INPUT -p tcp --dport 5060:5080 -j DROP
     
-    # 保存防火墙规则
+    # 保存防火墙规则到配置目录
     iptables-save > "$CONFIG_DIR/iprule.conf"
+    
+    # 同时保存到项目根目录，方便查看
+    if [ -d "$SCRIPT_DIR" ]; then
+        iptables-save > "$SCRIPT_DIR/iptables_rules.conf"
+        echo "防火墙规则已保存到: $SCRIPT_DIR/iptables_rules.conf"
+    fi
     
     echo "防火墙规则应用完成"
 }
@@ -267,24 +295,58 @@ apply_iptables_rules() {
 restore_firewall() {
     echo "正在恢复防火墙规则..."
     
-    # 检查配置文件是否存在
-    if [ ! -f "$CONFIG_DIR/china.conf" ]; then
-        echo "错误: 未找到 china.conf 配置文件"
+    local iprule_file="$CONFIG_DIR/iprule.conf"
+    local china_file="$CONFIG_DIR/china.conf"
+    
+    # 检查配置文件是否存在，如果配置目录下没有，则尝试从项目根目录复制
+    if [ ! -f "$china_file" ] && [ -f "$SCRIPT_DIR/ipset_rules.conf" ]; then
+        echo "从项目根目录复制 ipset 规则..."
+        cp "$SCRIPT_DIR/ipset_rules.conf" "$china_file"
+    fi
+    
+    if [ ! -f "$iprule_file" ] && [ -f "$SCRIPT_DIR/iptables_rules.conf" ]; then
+        echo "从项目根目录复制 iptables 规则..."
+        cp "$SCRIPT_DIR/iptables_rules.conf" "$iprule_file"
+    fi
+    
+    # 再次检查配置文件是否存在
+    if [ ! -f "$china_file" ]; then
+        echo "错误: 未找到 ipset 规则文件"
         exit 1
     fi
     
-    if [ ! -f "$CONFIG_DIR/iprule.conf" ]; then
-        echo "错误: 未找到 iprule.conf 配置文件"
+    if [ ! -f "$iprule_file" ]; then
+        echo "错误: 未找到 iptables 规则文件"
         exit 1
     fi
+    
+    # 清空现有规则
+    iptables -F
+    iptables -X
+    iptables -Z
     
     # 恢复 ipset 规则
-    ipset restore < "$CONFIG_DIR/china.conf"
+    echo "正在恢复 ipset 规则..."
+    ipset restore < "$china_file"
     
     # 恢复 iptables 规则
-    iptables-restore < "$CONFIG_DIR/iprule.conf"
+    echo "正在恢复 iptables 规则..."
+    iptables-restore < "$iprule_file"
     
-    echo "防火墙规则恢复完成"
+    # 保存当前规则到项目根目录，方便查看
+    if [ -d "$SCRIPT_DIR" ]; then
+        iptables-save > "$SCRIPT_DIR/iptables_rules.conf"
+        ipset save > "$SCRIPT_DIR/ipset_rules.conf"
+        echo "当前防火墙规则已保存到项目根目录"
+    fi
+    
+    # 显示当前规则状态
+    echo -e "\n=== 当前 iptables 规则 ==="
+    iptables -L -v -n --line-numbers
+    echo -e "\n=== 当前 ipset 规则 ==="
+    ipset list
+    
+    echo -e "\n防火墙规则恢复完成"
 }
 
 # 安装服务
@@ -413,6 +475,13 @@ EOF
     # 初始化防火墙规则
     apply_iptables_rules
     
+    # 保存初始规则到项目根目录
+    if [ -d "$SCRIPT_DIR" ]; then
+        iptables-save > "$SCRIPT_DIR/iptables_rules.conf"
+        ipset save > "$SCRIPT_DIR/ipset_rules.conf"
+        echo "初始防火墙规则已保存到项目根目录"
+    fi
+    
     # 启用并启动服务
     chkconfig --add safetable
     chkconfig safetable on
@@ -449,6 +518,12 @@ uninstall_service() {
 main() {
     # 初始化变量
     OFFLINE_INSTALL="false"
+    
+    # 处理 --restore 参数
+    if [ "$1" = "--restore" ] || [ "$1" = "-r" ]; then
+        restore_firewall
+        exit 0
+    fi
     
     # 如果没有参数，显示帮助
     if [ $# -eq 0 ]; then
