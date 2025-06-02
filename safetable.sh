@@ -55,64 +55,64 @@ setup_repo() {
 
 # 检查必要的软件包是否已安装
 check_packages() {
-    echo "正在检查必要的软件包..."
+    log "正在检查必要的软件包..."
     
-    # 检查ipset是否已安装
-    if ! rpm -q ipset &>/dev/null; then
-        echo "ipset未安装，尝试安装..."
-        yum -y install ipset || {
-            echo "警告: 无法通过YUM安装ipset，尝试使用本地安装..."
-            if [ -f "$SCRIPT_DIR/packages/ipset.rpm" ]; then
-                rpm -ivh "$SCRIPT_DIR/packages/ipset.rpm" || { 
-                    echo "错误: 无法安装ipset"; 
-                    exit 1; 
-                }
-            else
-                echo "错误: 未找到ipset安装包，请手动安装ipset后重试"
-                exit 1
-            fi
+    # 安装EPEL仓库
+    if ! rpm -q epel-release &>/dev/null; then
+        log "安装EPEL仓库..."
+        yum install -y epel-release || {
+            log "警告: 无法安装EPEL仓库，某些功能可能受限"
         }
     fi
     
-    # 检查iptables是否已安装
-    if ! rpm -q iptables &>/dev/null; then
-        echo "iptables未安装，尝试安装..."
-        yum -y install iptables || {
-            echo "警告: 无法通过YUM安装iptables，尝试使用本地安装..."
-            if [ -f "$SCRIPT_DIR/packages/iptables.rpm" ]; then
-                rpm -ivh "$SCRIPT_DIR/packages/iptables.rpm" || { 
-                    echo "错误: 无法安装iptables"; 
-                    exit 1; 
-                }
-            else
-                echo "错误: 未找到iptables安装包，请手动安装iptables后重试"
-                exit 1
-            fi
-        }
+    # 更新系统
+    log "更新系统软件包..."
+    yum update -y -q
+    
+    # 安装必要软件包
+    local packages=("ipset" "iptables" "iptables-services" "wget" "curl")
+    
+    for pkg in "${packages[@]}"; do
+        if ! rpm -q $pkg &>/dev/null; then
+            log "安装 $pkg..."
+            yum install -y $pkg || {
+                log "错误: 无法安装 $pkg"
+                return 1
+            }
+        fi
+    done
+    
+    # 确保iptables服务已启用并启动
+    systemctl enable iptables >/dev/null 2>&1
+    systemctl start iptables >/dev/null 2>&1
+    
+    # 禁用firewalld（如果已安装）
+    if systemctl is-active firewalld >/dev/null 2>&1; then
+        log "检测到firewalld，正在停止并禁用..."
+        systemctl stop firewalld
+        systemctl disable firewalld
     fi
     
-    # 检查wget是否已安装
-    if ! rpm -q wget &>/dev/null; then
-        echo "wget未安装，尝试安装..."
-        yum -y install wget || {
-            echo "警告: 无法通过YUM安装wget，尝试使用本地安装..."
-            if [ -f "$SCRIPT_DIR/packages/wget.rpm" ]; then
-                rpm -ivh "$SCRIPT_DIR/packages/wget.rpm" || { 
-                    echo "错误: 无法安装wget"; 
-                    exit 1; 
-                }
-            else
-                echo "警告: 未找到wget安装包，将无法在线更新IP列表"
-            fi
-        }
-    fi
+    # 加载必要的内核模块
+    local modules=("ip_set" "xt_set" "ip_set_hash_net")
+    for mod in "${modules[@]}"; do
+        if ! lsmod | grep -q "^${mod}"; then
+            log "加载内核模块: $mod"
+            modprobe $mod || {
+                log "警告: 无法加载内核模块 $mod"
+            }
+        fi
+    done
     
-    echo "软件包检查完成"
+    # 确保模块在重启后自动加载
+    echo -e "ip_set\nxt_set\nip_set_hash_net" > /etc/modules-load.d/safetable.conf
+    
+    log "软件包检查完成"
 }
 
 # 初始化中国IP列表
 init_china_ip() {
-    echo "正在初始化中国IP列表..."
+    log "正在初始化中国IP列表..."
     
     # 创建IP列表目录
     mkdir -p "$CONFIG_DIR/data"
@@ -120,74 +120,92 @@ init_china_ip() {
     
     # 检查是否为离线安装
     if [ "$OFFLINE_INSTALL" = "true" ]; then
-        echo "离线安装模式，使用预设的中国IP列表..."
+        log "离线安装模式，使用预设的中国IP列表..."
         
         # 检查是否有预设的IP列表文件
         if [ -f "$SCRIPT_DIR/china_ip.txt" ]; then
             cp "$SCRIPT_DIR/china_ip.txt" "$CHINA_IP_FILE"
+            log "使用预设的IP列表文件: $SCRIPT_DIR/china_ip.txt"
         else
-            echo "警告: 未找到预设的中国IP列表文件，将使用基本内网IP"
+            log "警告: 未找到预设的中国IP列表文件，将使用基本内网IP"
             # 创建基本的内网IP列表
             cat > "$CHINA_IP_FILE" << EOF
+# 内网IP段
 192.168.0.0/16
 172.16.0.0/12
 10.0.0.0/8
 127.0.0.0/8
+# 本地回环
+::1/128
+fe80::/10
+fc00::/7
 EOF
         fi
     else
         # 在线下载中国IP列表
         if command -v wget &>/dev/null; then
-            echo "正在下载中国IP列表..."
-            wget --no-check-certificate -O- 'http://ftp.apnic.net/apnic/stats/apnic/delegated-apnic-latest' | \
-                awk -F\| '/CN\|ipv4/ { printf("%s/%d\n", $4, 32-log($5)/log(2)) }' > "$CHINA_IP_FILE" || {
-                echo "警告: 无法下载中国IP列表，使用预设的IP列表..."
-                if [ -f "$SCRIPT_DIR/china_ip.txt" ]; then
-                    cp "$SCRIPT_DIR/china_ip.txt" "$CHINA_IP_FILE"
-                else
-                    echo "警告: 未找到预设的中国IP列表文件，将使用基本内网IP"
-                    # 创建基本的内网IP列表
-                    cat > "$CHINA_IP_FILE" << EOF
-192.168.0.0/16
-172.16.0.0/12
-10.0.0.0/8
-127.0.0.0/8
-EOF
-                fi
-            }
-        else
-            echo "警告: wget未安装，无法下载中国IP列表，使用预设的IP列表..."
-            if [ -f "$SCRIPT_DIR/china_ip.txt" ]; then
-                cp "$SCRIPT_DIR/china_ip.txt" "$CHINA_IP_FILE"
-            else
-                echo "警告: 未找到预设的中国IP列表文件，将使用基本内网IP"
-                # 创建基本的内网IP列表
-                cat > "$CHINA_IP_FILE" << EOF
-192.168.0.0/16
-172.16.0.0/12
-10.0.0.0/8
-127.0.0.0/8
-EOF
+            log "正在从APNIC下载中国IP列表..."
+            if ! wget --no-check-certificate -O- 'http://ftp.apnic.net/apnic/stats/apnic/delegated-apnic-latest' 2>/dev/null | \
+                awk -F\| '/CN\|ipv4/ { printf("%s/%d\n", $4, 32-log($5)/log(2)) }' > "${CHINA_IP_FILE}.tmp"; then
+                log "错误: 无法下载中国IP列表"
+                return 1
             fi
+            
+            # 检查下载的文件是否有效
+            if [ -s "${CHINA_IP_FILE}.tmp" ]; then
+                mv "${CHINA_IP_FILE}.tmp" "$CHINA_IP_FILE"
+                log "成功下载中国IP列表，共 $(wc -l < "$CHINA_IP_FILE") 个IP段"
+            else
+                log "错误: 下载的IP列表为空"
+                return 1
+            fi
+            
+            # 添加内网IP段到列表
+            cat >> "$CHINA_IP_FILE" << EOF
+
+# 内网IP段
+192.168.0.0/16
+172.16.0.0/12
+10.0.0.0/8
+127.0.0.0/8
+# 本地回环
+::1/128
+fe80::/10
+fc00::/7
+EOF
+        else
+            log "错误: wget未安装，无法下载中国IP列表"
+            return 1
         fi
     fi
     
     # 初始化ipset
+    log "正在创建ipset集合..."
     ipset destroy china 2>/dev/null
-    ipset create china hash:net maxelem 65536
-    ipset flush china
+    if ! ipset create china hash:net family inet hashsize 65536 maxelem 1000000; then
+        log "错误: 无法创建ipset集合"
+        return 1
+    fi
     
     # 添加IP到ipset
+    log "正在添加IP到ipset..."
+    local count=0
     while read ip; do
-        ipset add china $ip
+        # 跳过空行和注释
+        [ -z "$ip" ] && continue
+        [[ "$ip" =~ ^# ]] && continue
+        
+        if ipset add china "$ip" 2>/dev/null; then
+            ((count++))
+        fi
     done < "$CHINA_IP_FILE"
     
     # 保存ipset规则
     mkdir -p /etc/ipset
-    ipset save china > "/etc/ipset/china.conf"
-    cp "/etc/ipset/china.conf" "$CONFIG_DIR/china.conf"
+    ipset save > "/etc/ipset/ipset.rules"
     
-    echo "中国IP列表初始化完成"
+    log "中国IP列表初始化完成，共添加 $count 个IP段"
+    return 0
 }
 
 # 更新中国IP列表
@@ -249,46 +267,96 @@ update_china_ip() {
 
 # 应用iptables规则
 apply_iptables_rules() {
-    echo "正在应用防火墙规则..."
+    log "正在应用防火墙规则..."
     
-    # 清空现有规则
+    # 检查ipset集合是否存在
+    if ! ipset list china >/dev/null 2>&1; then
+        log "错误: ipset集合'china'不存在，请先初始化中国IP列表"
+        return 1
+    fi
+    
+    # 加载必要的内核模块
+    for module in ip_tables iptable_filter ip_conntrack ip_conntrack_ftp ip_nat_ftp; do
+        modprobe $module 2>/dev/null
+    done
+    
+    # 清空现有规则和链
     iptables -F
+    iptables -t nat -F
+    iptables -t mangle -F
     iptables -X
-    iptables -Z
+    iptables -t nat -X
+    iptables -t mangle -X
     
     # 设置默认策略
-    iptables -P INPUT ACCEPT
+    iptables -P INPUT DROP
     iptables -P FORWARD DROP
     iptables -P OUTPUT ACCEPT
     
     # 允许本地回环
     iptables -A INPUT -i lo -j ACCEPT
+    iptables -A OUTPUT -o lo -j ACCEPT
     
     # 允许已建立的连接
-    iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+    iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     
-    # 允许Ping
-    iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
+    # 允许Ping (ICMP)
+    iptables -A INPUT -p icmp --icmp-type echo-request -m limit --limit 1/s -j ACCEPT
+    iptables -A OUTPUT -p icmp --icmp-type echo-request -j ACCEPT
     
-    # 允许SSH连接（修改为您自己的SSH端口）
+    # 允许SSH连接（22端口）
     iptables -A INPUT -p tcp --dport 22 -j ACCEPT
     
-    # 允许SIP相关端口（5060-5080）
-    iptables -A INPUT -p udp --dport 5060:5080 -m set --match-set china src -j ACCEPT
-    iptables -A INPUT -p udp --dport 5060:5080 -j DROP
-    iptables -A INPUT -p tcp --dport 5060:5080 -m set --match-set china src -j ACCEPT
-    iptables -A INPUT -p tcp --dport 5060:5080 -j DROP
+    # SIP相关端口（5060-5080）只允许中国IP访问
+    for port in 5060 5061 5070 5080; do
+        # UDP协议
+        iptables -A INPUT -p udp --dport $port -m set --match-set china src -j ACCEPT
+        iptables -A INPUT -p udp --dport $port -j LOG --log-prefix "[SIP-UDP-DROP] " --log-level 4
+        iptables -A INPUT -p udp --dport $port -j DROP
+        
+        # TCP协议
+        iptables -A INPUT -p tcp --dport $port -m set --match-set china src -j ACCEPT
+        iptables -A INPUT -p tcp --dport $port -j LOG --log-prefix "[SIP-TCP-DROP] " --log-level 4
+        iptables -A INPUT -p tcp --dport $port -j DROP
+    done
     
-    # 保存防火墙规则到配置目录
-    iptables-save > "$CONFIG_DIR/iprule.conf"
+    # 允许DNS查询
+    iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+    iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
     
-    # 同时保存到项目根目录，方便查看
-    if [ -d "$SCRIPT_DIR" ]; then
-        iptables-save > "$SCRIPT_DIR/iptables_rules.conf"
-        echo "防火墙规则已保存到: $SCRIPT_DIR/iptables_rules.conf"
+    # 允许NTP时间同步
+    iptables -A OUTPUT -p udp --dport 123 -j ACCEPT
+    
+    # 允许HTTP/HTTPS（用于yum更新等）
+    iptables -A OUTPUT -p tcp --dport 80 -j ACCEPT
+    iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT
+    
+    # 记录被拒绝的数据包（限制日志大小）
+    iptables -N LOGGING
+    iptables -A INPUT -j LOGGING
+    iptables -A LOGGING -m limit --limit 2/min -j LOG --log-prefix "[IPTABLES-DROP] " --log-level 4
+    iptables -A LOGGING -j DROP
+    
+    # 保存iptables规则
+    mkdir -p /etc/iptables
+    if ! iptables-save > /etc/iptables/rules.v4; then
+        log "警告: 无法保存iptables规则"
+        return 1
     fi
     
-    echo "防火墙规则应用完成"
+    # 配置iptables服务
+    if ! systemctl is-active iptables >/dev/null 2>&1; then
+        systemctl enable iptables --now
+    else
+        systemctl restart iptables
+    fi
+    
+    # 保存当前配置
+    service iptables save
+    
+    log "防火墙规则应用完成"
+    return 0
 }
 
 # 恢复防火墙规则
